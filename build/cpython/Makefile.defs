@@ -1,0 +1,9 @@
+
+# ifeq ($(CPYTHON_BINDIR),)
+# $(error CPYTHON_BINDIR not defined. Aborting.)
+# endif
+
+LIBPYTHON=$(CPYTHON_BINDIR)/libpython3.7m-fixed.a
+
+GEARS_VERSION:=$(shell $(ROOT)/getver)
+export CPYTHON_PREFIX=$(abspath $(CPYTHON_BINDIR)/../python3_$(GEARS_VERSION))

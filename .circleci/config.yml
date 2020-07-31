@@ -1,0 +1,257 @@
+version: 2.1
+
+commands:
+  setup-executor:
+    steps:
+      - run:
+          name: Setup executor
+          command: |
+            apt-get -qq update
+            apt-get -q install -y git openssh-client curl ca-certificates make tar gzip
+            bash <(curl -fsSL https://get.docker.com)
+      - setup_remote_docker:
+          docker_layer_caching: true
+
+  build-steps:
+    parameters:
+      platform:
+        type: string
+      build_params:
+        type: string
+        default: ""
+      test_params:
+        type: string
+        default: ""
+    steps:
+      - checkout
+      - run:
+          name: Submodule checkout
+          command: git submodule update --init --recursive
+      - run:
+          name: System setup
+          command: BREW_NO_UPDATE=1 python system-setup.py
+      - run:
+          name: Build
+          command: |
+            make get_deps
+            make all OS_VERSION=<<parameters.platform>> <<parameters.build_params>> SHOW=1
+      - run:
+          name: Test
+          command: make test <<parameters.test_params>>
+      - store_artifacts:
+          path: pytest/logs
+
+  platform-build-steps:
+    parameters:
+      platform:
+        type: string
+    steps:
+      - setup-executor
+      - checkout
+      - run:
+          name: Setup
+          command: |
+            git submodule update --init --recursive
+            ./deps/readies/bin/getpy2
+      - run:
+          name: Build for platform
+          command: |
+            docker login -u redisfab -p $DOCKER_REDISFAB_PWD
+            pushd build/docker
+            make build publish $(./version-params) OSNICK=<<parameters.platform>> X64=1 ARTIFACTS=1 TEST=1 SHOW=1
+            popd
+            logs_d=pytest/logs/<<parameters.platform>>
+            mkdir -p $logs_d
+            tar -C $logs_d -xzf artifacts/pytest-logs*.tgz
+          no_output_timeout: 40m
+      - store_artifacts:
+          path: pytest/logs
+      - persist_to_workspace:
+          root: artifacts
+          paths:
+            - 'snapshot/*.zip'
+            - 'snapshot/*.tgz'
+            - 'release/*.zip'
+            - 'release/*.tgz'
+
+jobs:
+  linux-debian:
+    docker:
+      - image: redisfab/rmbuilder:6.0.1-x64-buster
+    steps:
+      - build-steps:
+          platform: debian
+
+  valgrind:
+    docker:
+      - image: redisfab/rmbuilder:6.0.1-x64-buster
+    steps:
+      - run:
+          name: Build Redis for Valgrind
+          command: cd ..; git clone https://github.com/antirez/redis.git; cd redis; git checkout 6.0.1; make valgrind; make install
+      - build-steps:
+          platform: debian
+          build_params: DEBUG=1
+          test_params: DEBUG=1
+
+  platform-build:
+    parameters:
+      platform:
+        type: string
+    docker:
+      - image: debian:buster
+    steps:
+      - platform-build-steps:
+          platform: <<parameters.platform>>
+
+  macos:
+    macos:
+      xcode: 11.3.0
+    steps:
+      - run:
+          name: Fix macOS setup
+          command: |
+            brew update || true
+            # workaround for ramp pack failure
+            sudo mkdir -p /var/opt/redislabs
+            sudo chmod 777 /var/opt/redislabs
+      - build-steps:
+          platform: macosx
+
+  build-multiarch-docker:
+    machine:
+      enabled: true
+      image: cimg/base:2020.01
+    steps:
+      - checkout
+      - run:
+          name: Setup Docker client experimental features
+          command: |
+            sudo ./deps/readies/bin/getdocker --just-enable-exp
+            docker version
+      - run:
+          name: Build
+          command: |
+            sudo docker login -u redisfab -p $DOCKER_REDISFAB_PWD
+            cd build/docker
+            make build
+            sudo make publish
+
+  deploy_snapshots:
+    docker:
+      - image: redisfab/rmbuilder:6.0.1-x64-buster
+    steps:
+      - attach_workspace:
+          at: artifacts
+      - run:
+          name: Deploy Snapshots to S3
+          command: |
+            for f in artifacts/snapshot/*.zip artifacts/snapshot/*.tgz; do
+              aws s3 cp $f s3://redismodules/redisgears/snapshots/ --acl public-read
+            done
+
+  deploy_releases:
+    docker:
+      - image: redisfab/rmbuilder:6.0.1-x64-buster
+    steps:
+      - attach_workspace:
+          at: artifacts
+      - run:
+          name: Deploy Releases to S3
+          command: |
+            for f in artifacts/release/*.zip artifacts/release/*.tgz; do
+              aws s3 cp $f s3://redismodules/redisgears/ --acl public-read
+            done
+
+
+on-any-branch: &on-any-branch
+  filters:
+    branches:
+      only: /.*/
+    tags:
+      only: /.*/
+
+never: &never
+  filters:
+    branches:
+      ignore: /.*/
+    tags:
+      ignore: /.*/
+
+on-master: &on-master
+  filters:
+    branches:
+      only: master
+
+on-version-tags: &on-version-tags
+  filters:
+    branches:
+      ignore: /.*/
+    tags:
+      only: /^v[0-9].*/
+
+on-master-and-version-tags: &on-master-and-version-tags
+  filters:
+    branches:
+      only:
+        - master
+    tags:
+      only: /^v[0-9].*/
+
+
+platform-build-defs: &platform-build-defs
+  requires:
+    - linux-debian
+  <<: *on-master-and-version-tags
+  # <<: *on-any-branch
+
+after-platform-builds: &after-platform-builds
+  requires:
+    - build-centos7
+    - build-bionic
+    - build-xenial
+
+
+workflows:
+  version: 2
+  default_flow:
+    jobs:
+      - linux-debian:
+          <<: *on-any-branch
+      - platform-build:
+          name: build-centos7
+          platform: centos7
+          <<: *platform-build-defs
+      - platform-build:
+          name: build-bionic
+          platform: bionic
+          <<: *platform-build-defs
+      - platform-build:
+          name: build-xenial
+          platform: xenial
+          <<: *platform-build-defs
+      - valgrind:
+          <<: *on-version-tags
+          # <<: *on-any-branch
+      - macos:
+          <<: *on-version-tags
+          # <<: *on-any-branch
+      - build-multiarch-docker:
+          <<: *never
+          # <<: *on-version-tags
+      - deploy_snapshots:
+          <<: *after-platform-builds
+          <<: *on-master
+          # <<: *on-any-branch
+      - deploy_releases:
+          <<: *after-platform-builds
+          <<: *on-version-tags
+
+  nightly:
+    triggers:
+      - schedule:
+          cron: "20 17 * * *"
+          <<: *on-master
+    jobs:
+      - macos
+      - valgrind
